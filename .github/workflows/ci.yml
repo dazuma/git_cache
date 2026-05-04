@@ -72,4 +72,8 @@ jobs:
         run: "gem install --no-document toys"
       - name: Run ${{ matrix.steps }}
         shell: bash
-        run: toys ci --only ${{ matrix.steps }} < /dev/null
+        env:
+          TEST_INTEGRATION: "true"
+        run: |
+          toys ci-init
+          toys ci --only ${{ matrix.steps }} < /dev/null
