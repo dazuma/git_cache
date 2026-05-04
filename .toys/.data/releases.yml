@@ -1,0 +1,10 @@
+repo: dazuma/git_cache
+git_user_name: Daniel Azuma
+git_user_email: dazuma@gmail.com
+required_checks: false
+update_existing_requests: true
+issue_number_suffix_handling: delete
+
+gems:
+  - name: git_cache
+    gh_pages_directory: gem

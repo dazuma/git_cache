@@ -1,0 +1,11 @@
+--no-private
+--title=GitCache
+--markup=markdown
+--markup-provider redcarpet
+--main=README.md
+./lib/git_cache/**/*.rb
+./lib/git_cache.rb
+-
+README.md
+LICENSE.md
+CHANGELOG.md
