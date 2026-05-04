@@ -1,5 +1,9 @@
 # frozen_string_literal: true
 
+require "git_cache/error"
+require "git_cache/repo_info"
+require "git_cache/repo_lock"
+
 ##
 # This object provides cached access to remote git data. Given a remote
 # repository, a path, and a commit, it makes the files available in the
@@ -7,299 +11,6 @@
 # commit and path in the same repo do not hit the remote repository again.
 #
 class GitCache
-  ##
-  # GitCache encountered a failure
-  #
-  class Error < ::StandardError
-    ##
-    # Create a GitCache::Error.
-    #
-    # @param message [String] The error message
-    # @param result [::ExecService::Result] The result of a git
-    #     command execution, or `nil` if this error was not due to a git
-    #     command error.
-    #
-    def initialize(message, result)
-      super(message)
-      @exec_result = result
-    end
-
-    ##
-    # @return [::ExecService::Result] The result of a git command
-    #     execution, or `nil` if this error was not due to a git command
-    #     error.
-    #
-    attr_reader :exec_result
-  end
-
-  ##
-  # Information about a remote git repository in the cache.
-  #
-  # This object is returned from {GitCache#repo_info}.
-  #
-  class RepoInfo
-    include ::Comparable
-
-    ##
-    # The base directory of this git repository's cache entry. This
-    # directory contains all cached data related to this repo. Deleting it
-    # effectively removes the repo from the cache.
-    #
-    # @return [String]
-    #
-    attr_reader :base_dir
-
-    ##
-    # The git remote, usually a file system path or URL.
-    #
-    # @return [String]
-    #
-    attr_reader :remote
-
-    ##
-    # The last time any cached data from this repo was accessed, or `nil`
-    # if the information is unavailable.
-    #
-    # @return [Time,nil]
-    #
-    attr_reader :last_accessed
-
-    ##
-    # A list of git refs (branches, tags, shas) that have been accessed
-    # from this repo.
-    #
-    # @param ref [String,nil] If provided, return only entries matching
-    #     this ref name. If omitted, return all entries.
-    # @return [Array<RefInfo>]
-    #
-    def refs(ref: nil)
-      return @refs.dup if ref.nil?
-      @refs.find_all { |elem| elem.ref == ref }
-    end
-
-    ##
-    # A list of shared source files and directories accessed for this repo.
-    #
-    # @param sha [String,nil] If provided, return only entries matching
-    #     this SHA. If omitted, entries for all SHAs are included.
-    # @param git_path [String,nil] If provided, return only entries
-    #     matching this git path. If omitted, entries for all paths are
-    #     included.
-    # @return [Array<SourceInfo>]
-    #
-    def sources(sha: nil, git_path: nil)
-      return @sources.dup if sha.nil? && git_path.nil?
-      @sources.find_all do |elem|
-        (sha.nil? || elem.sha == sha) &&
-          (git_path.nil? || elem.git_path == git_path)
-      end
-    end
-
-    ##
-    # Convert this RepoInfo to a hash suitable for JSON output
-    #
-    # @return [Hash]
-    #
-    def to_h
-      result = {
-        "remote" => remote,
-        "base_dir" => base_dir,
-      }
-      result["last_accessed"] = last_accessed.to_i if last_accessed
-      result["refs"] = refs.map(&:to_h)
-      result["sources"] = sources.map(&:to_h)
-      result
-    end
-
-    ##
-    # Comparison function
-    #
-    # @param other [RepoInfo]
-    # @return [Integer]
-    #
-    def <=>(other)
-      remote <=> other.remote
-    end
-
-    ##
-    # @private
-    #
-    def initialize(base_dir, data)
-      @base_dir = base_dir
-      @remote = data["remote"]
-      accessed = data["accessed"]
-      @last_accessed = accessed ? ::Time.at(accessed).utc : nil
-      @refs = (data["refs"] || {}).map { |ref, ref_data| RefInfo.new(ref, ref_data) }
-      @sources = (data["sources"] || {}).flat_map do |sha, sha_data|
-        sha_data.map do |path, path_data|
-          SourceInfo.new(base_dir, sha, path, path_data)
-        end
-      end
-      @refs.sort!
-      @sources.sort!
-    end
-  end
-
-  ##
-  # Information about a git ref used in a cache.
-  #
-  class RefInfo
-    include ::Comparable
-
-    ##
-    # The git ref
-    #
-    # @return [String]
-    #
-    attr_reader :ref
-
-    ##
-    # The git sha last associated with the ref
-    #
-    # @return [String]
-    #
-    attr_reader :sha
-
-    ##
-    # The timestamp when this ref was last accessed
-    #
-    # @return [Time,nil]
-    #
-    attr_reader :last_accessed
-
-    ##
-    # The timestamp when this ref was last updated
-    #
-    # @return [Time,nil]
-    #
-    attr_reader :last_updated
-
-    ##
-    # Convert this RefInfo to a hash suitable for JSON output
-    #
-    # @return [Hash]
-    #
-    def to_h
-      result = {
-        "ref" => ref,
-        "sha" => sha,
-      }
-      result["last_accessed"] = last_accessed.to_i if last_accessed
-      result["last_updated"] = last_updated.to_i if last_updated
-      result
-    end
-
-    ##
-    # Comparison function
-    #
-    # @param other [RefInfo]
-    # @return [Integer]
-    #
-    def <=>(other)
-      ref <=> other.ref
-    end
-
-    ##
-    # @private
-    #
-    def initialize(ref, ref_data)
-      @ref = ref
-      @sha = ref_data["sha"]
-      @last_accessed = ref_data["accessed"]
-      @last_accessed = ::Time.at(@last_accessed).utc if @last_accessed
-      @last_updated = ref_data["updated"]
-      @last_updated = ::Time.at(@last_updated).utc if @last_updated
-    end
-  end
-
-  ##
-  # Information about shared source files provided from the cache.
-  #
-  class SourceInfo
-    include ::Comparable
-
-    ##
-    # The git sha the source comes from
-    #
-    # @return [String]
-    #
-    attr_reader :sha
-
-    ##
-    # The path within the git repo
-    #
-    # @return [String]
-    #
-    attr_reader :git_path
-
-    ##
-    # The path to the source file or directory
-    #
-    # @return [String]
-    #
-    attr_reader :source
-
-    ##
-    # The timestamp when this ref was last accessed
-    #
-    # @return [Time,nil]
-    #
-    attr_reader :last_accessed
-
-    ##
-    # Convert this SourceInfo to a hash suitable for JSON output
-    #
-    # @return [Hash]
-    #
-    def to_h
-      result = {
-        "sha" => sha,
-        "git_path" => git_path,
-        "source" => source,
-      }
-      result["last_accessed"] = last_accessed.to_i if last_accessed
-      result
-    end
-
-    ##
-    # Comparison function
-    #
-    # @param other [SourceInfo]
-    # @return [Integer]
-    #
-    def <=>(other)
-      result = sha <=> other.sha
-      result.zero? ? git_path <=> other.git_path : result
-    end
-
-    ##
-    # @private
-    #
-    def initialize(base_dir, sha, git_path, path_data)
-      @sha = sha
-      @git_path = git_path
-      root_dir = ::File.join(base_dir, sha)
-      @source = ::GitCache.safe_join(root_dir, git_path)
-      @last_accessed = path_data["accessed"]
-      @last_accessed = @last_accessed ? ::Time.at(@last_accessed).utc : nil
-    end
-  end
-
-  ##
-  # Returns whether shared source files are writable by default.
-  # Normally, shared sources are made read-only to protect them from being
-  # modified accidentally since multiple clients may be accessing them.
-  # However, you can disable this feature by setting the environment
-  # variable `GIT_CACHE_WRITABLE` to any non-empty value. This can be
-  # useful in environments that want to clean up temporary directories and
-  # are being hindered by read-only files.
-  #
-  # @return [boolean]
-  #
-  def self.sources_writable?
-    !::ENV["GIT_CACHE_WRITABLE"].to_s.empty?
-  end
-
   ##
   # Access a git cache.
   #
@@ -503,9 +214,10 @@ class GitCache
 
   private
 
+  FORMAT_VERSION = "v1"
   REPO_DIR_NAME = "repo"
   LOCK_FILE_NAME = "repo.lock"
-  private_constant :REPO_DIR_NAME, :LOCK_FILE_NAME
+  private_constant :REPO_DIR_NAME, :LOCK_FILE_NAME, :FORMAT_VERSION
 
   def repo_base_dir_for(remote)
     ::File.join(@cache_dir, ::GitCache.remote_dir_name(remote))
@@ -513,7 +225,7 @@ class GitCache
 
   def default_cache_dir
     require "simple_xdg"
-    ::File.join(::SimpleXDG.new.cache_home, "git-cache")
+    ::File.join(::SimpleXDG.new.cache_home, "git-cache", FORMAT_VERSION)
   end
 
   def git(dir, cmd, error_message: nil)
@@ -653,204 +365,22 @@ class GitCache
     nil
   end
 
-  ##
-  # Associated with each repo (remote) is a lock file that saves the status
-  # of the cache, and also serves as a file system lock for updates to the
-  # repo. This is handled by the lock_repo method.
-  #
-  # This object represents the state of the repo, and is made available to
-  # the block passed to lock_repo. It has the following schema:
-  #
-  #     remote: (String)           # the remote url
-  #     accessed: (Integer)        # last accessed timestamp
-  #     refs:
-  #       (String):                # git ref
-  #         sha: (String)          # resolved sha
-  #         updated: (Integer)     # last updated timestamp
-  #         accessed: (Integer)    # last accessed timestamp
-  #     sources:
-  #       (String):                # sha of the shared source
-  #         (String):              # path populated
-  #           accessed: (Integer)  # last accessed timestamp
-  #
-  # @private
-  #
-  class RepoLock
-    ##
-    # @private
-    #
-    def initialize(io, remote, timestamp)
-      @data = ::JSON.parse(io.read) rescue {} # rubocop:disable Style/RescueModifier
-      @data["remote"] ||= remote
-      @data["refs"] ||= {}
-      @data["sources"] ||= {}
-      @modified = false
-      @timestamp = timestamp || ::Time.now.to_i
-    end
-
-    ##
-    # @private
-    #
-    attr_reader :data
-
-    ##
-    # @private
-    #
-    def modified?
-      @modified
-    end
-
-    ##
-    # @private
-    #
-    def dump(io)
-      ::JSON.dump(@data, io)
-    end
-
-    ##
-    # @private
-    #
-    def remote
-      @data["remote"]
-    end
-
-    ##
-    # @private
-    #
-    def refs
-      @data["refs"].keys
-    end
-
-    ##
-    # @private
-    #
-    def lookup_ref(ref)
-      return ref if ::GitCache.valid_sha?(ref)
-      @data["refs"][ref]&.fetch("sha", nil)
-    end
-
-    ##
-    # @private
-    #
-    def ref_data(ref)
-      @data["refs"][ref]
-    end
-
-    ##
-    # @private
-    #
-    def ref_stale?(ref, age)
-      ref_info = @data["refs"][ref]
-      last_updated = ref_info ? ref_info.fetch("updated", 0) : 0
-      return true if last_updated.zero?
-      return age unless age.is_a?(::Numeric)
-      @timestamp >= last_updated + age
-    end
-
-    ##
-    # @private
-    #
-    def source_exists?(sha, path = nil)
-      sha_info = @data["sources"][sha]
-      return false if sha_info.nil?
-      return true if path.nil?
-      sha_info.key?(path) || sha_info.key?(".") ||
-        sha_info.keys.any? { |existing_path| path.start_with?("#{existing_path}/") }
-    end
-
-    ##
-    # @private
-    #
-    def source_data(sha, path)
-      @data["sources"][sha]&.fetch(path, nil)
-    end
-
-    ##
-    # @private
-    #
-    def find_sources(paths: nil, shas: nil)
-      results = []
-      @data["sources"].each do |sha, sha_data|
-        next unless shas.nil? || shas.include?(sha)
-        sha_data.each_key do |path|
-          next unless paths.nil? || paths.include?(path)
-          results << [sha, path]
-        end
-      end
-      results
-    end
-
-    ##
-    # @private
-    #
-    def access_repo!
-      is_first = !@data.key?("accessed")
-      @data["accessed"] = @timestamp
-      @modified = true
-      is_first
-    end
-
-    ##
-    # @private
-    #
-    def access_ref!(ref, sha)
-      ref_info = @data["refs"][ref] ||= {}
-      ref_info["sha"] = sha
-      is_first = !ref_info.key?("accessed")
-      ref_info["accessed"] = @timestamp
-      @modified = true
-      is_first
-    end
-
-    ##
-    # @private
-    #
-    def update_ref!(ref)
-      ref_info = @data["refs"][ref] ||= {}
-      is_first = !ref_info.key?("updated")
-      ref_info["updated"] = @timestamp
-      @modified = true
-      is_first
-    end
-
-    ##
-    # @private
-    #
-    def delete_ref!(ref)
-      ref_data = @data["refs"].delete(ref)
-      @modified = true if ref_data
-      ref_data
-    end
-
-    ##
-    # @private
-    #
-    def access_source!(sha, path)
-      @data["accessed"] = @timestamp
-      source_info = @data["sources"][sha] ||= {}
-      path_info = source_info[path] ||= {}
-      is_first = !path_info.key?("accessed")
-      path_info["accessed"] = @timestamp
-      @modified = true
-      is_first
-    end
-
-    ##
-    # @private
-    #
-    def delete_source!(sha, path)
-      sha_data = @data["sources"][sha]
-      return nil if sha_data.nil?
-      source_data = sha_data.delete(path)
-      if source_data
-        @modified = true
-        @data["sources"].delete(sha) if sha_data.empty?
-      end
-      source_data
-    end
-  end
-
   class << self
+    ##
+    # Returns whether shared source files are writable by default.
+    # Normally, shared sources are made read-only to protect them from being
+    # modified accidentally since multiple clients may be accessing them.
+    # However, you can disable this feature by setting the environment
+    # variable `GIT_CACHE_WRITABLE` to any non-empty value. This can be
+    # useful in environments that want to clean up temporary directories and
+    # are being hindered by read-only files.
+    #
+    # @return [boolean]
+    #
+    def sources_writable?
+      !::ENV["GIT_CACHE_WRITABLE"].to_s.empty?
+    end
+
     ##
     # @private
     # Whether a given ref is a valid SHA-1 or SHA-256
