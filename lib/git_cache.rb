@@ -367,6 +367,7 @@ class GitCache
 
   class << self
     ##
+    # @private
     # Returns whether shared source files are writable by default.
     # Normally, shared sources are made read-only to protect them from being
     # modified accidentally since multiple clients may be accessing them.
