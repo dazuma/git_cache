@@ -57,9 +57,13 @@ The cache directory (default: `<XDG_CACHE_HOME>/git-cache/v1`) contains one subd
 
 A single `repo.lock` flock per remote serializes all writers for that remote across processes. Readers of shared sources don't take the lock and rely on the read-only permission bits to detect tampering only by convention. The lock is held for the duration of any `GitCache#get` call, including the `git fetch`, so concurrent calls to the same remote will serialize on the network operation.
 
+Every git invocation goes through the `git` helper, which injects `-c maintenance.auto=false`. Do not bypass it. Since git 2.47, `git fetch` ends by spawning `git maintenance run --auto --detach`, which keeps writing into `repo/.git/objects` *after* the fetch has returned — outside anything the flock protects, and racing with the cache's own traversals and removals. `gc.auto=0` is not a substitute: it only suppresses that spawn as of git 2.55. See issue #5.
+
 ### Removal APIs
 
-`remove_repos`, `remove_refs`, and `remove_sources` all `chmod_R u+w` before `rm_rf` to defeat the read-only protection. `remove_sources` also garbage-collects the per-SHA directory once its last source entry is dropped.
+All directory removal goes through the private `remove_dir`, which renames the directory to a `.trash-<random>` sibling before deleting it. The rename is atomic and unaffected by concurrent writes inside the tree, so the cache entry is gone for clients even if the delete can't finish; leftovers are invisible (nothing enumerates cache directories — `remotes` skips dot-prefixed children and requires a `repo.lock`, and `RepoInfo` reads only the lock JSON) and get swept by later removals. It falls back to an in-place retry loop where rename fails (Windows), and raises `GitCache::Error` if the directory survives both.
+
+`chmod_R u+w` before deleting defeats the read-only protection on shared sources, but must go through `chmod_recursive`: `FileUtils.chmod_R`'s `force:` guards only the chmod of each entry, not the traversal that finds them, so an entry vanishing mid-walk raises regardless of it. `remove_sources` also garbage-collects the per-SHA directory once its last source entry is dropped.
 
 ## Repository conventions
 

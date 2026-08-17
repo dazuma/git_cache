@@ -9,11 +9,11 @@ class GitCache
     # Create a GitCache::Error.
     #
     # @param message [String] The error message
-    # @param result [::ExecService::Result] The result of a git
-    #     command execution, or `nil` if this error was not due to a git
-    #     command error.
+    # @param result [::ExecService::Result,nil] The result of a git
+    #     command execution. Omit or pass `nil` if this error was not due to
+    #     a git command error.
     #
-    def initialize(message, result)
+    def initialize(message, result = nil)
       super(message)
       @exec_result = result
     end
