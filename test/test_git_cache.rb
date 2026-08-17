@@ -515,6 +515,55 @@ describe ::GitCache do
       refute(File.directory?(repo_dir))
     end
 
+    it "does not spawn background git maintenance" do
+      # Auto maintenance would run detached and keep writing into the cache
+      # repo after the fetch returns, racing with the cache's own removals.
+      commit_file("file1.txt")
+      trace_path = ::File.join(::Dir.tmpdir, "git_cache_test_trace.log")
+      ::FileUtils.rm_f(trace_path)
+      begin
+        # Must be set before the first use of this GitCache, so that the
+        # subprocess service inherits it.
+        ::ENV["GIT_TRACE"] = trace_path
+        git_cache.get(local_remote)
+      ensure
+        ::ENV.delete("GIT_TRACE")
+      end
+      trace = ::File.read(trace_path)
+      refute_empty(trace, "Expected git to write a trace log")
+      refute_match(/maintenance/, trace)
+    ensure
+      ::FileUtils.rm_f(trace_path)
+    end
+
+    it "leaves no trash behind after removing a repo" do
+      commit_file("file1.txt")
+      git_cache.get(local_remote)
+      git_cache.remove_repos(local_remote)
+      leftovers = ::Dir.children(cache_dir)
+      assert_empty(leftovers, "Expected an empty cache dir, got: #{leftovers}")
+    end
+
+    it "raises if a repo cannot be removed" do
+      # Windows ignores directory permission bits, and root overrides them.
+      skip("Requires POSIX directory permissions") if ::Gem.win_platform? || ::Process.uid.zero?
+      commit_file("file1.txt")
+      git_cache.get(local_remote)
+      base_dir = git_cache.repo_info(local_remote).base_dir
+      # A read-only cache dir blocks both the rename and the fallback delete.
+      ::File.chmod(0o500, cache_dir)
+      begin
+        error = assert_raises(::GitCache::Error) do
+          git_cache.remove_repos(local_remote)
+        end
+        assert_match(/Unable to remove directory/, error.message)
+        assert_nil(error.exec_result)
+        assert(::File.directory?(base_dir))
+      ensure
+        ::File.chmod(0o700, cache_dir)
+      end
+    end
+
     it "removes a ref" do
       file_name = "file1.txt"
       updated_content = "updated"
