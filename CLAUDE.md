@@ -67,8 +67,10 @@ All directory removal goes through the private `remove_dir`, which renames the d
 
 ## Repository conventions
 
-- Single-file library — resist the urge to split `lib/git_cache.rb` into multiple files without a clear reason; the gemspec globs `lib/**/*.rb` so additions ship automatically.
+- `lib/git_cache.rb` holds the `GitCache` class itself; value objects and internals live in `lib/git_cache/`. Resist splitting the main class further without a clear reason; the gemspec globs `lib/**/*.rb`, so additions ship automatically.
 - The gemspec deliberately excludes `CLAUDE.md` and `AGENTS.md` from the packaged gem.
 - Yardoc runs with `fail_on_warning` and `fail_on_undocumented_objects` — every public method/class/attribute needs a yard comment, and `@private` is the marker for internals (used heavily on `RepoLock`).
 - Rubocop config is in `.rubocop.yml`; respect it before committing.
 - The `.toys/` directory holds toys tool definitions and uses `toys-ci`. `.toys/.toys.rb` is the entrypoint; `.toys/ci.rb` defines the `ci` aggregate.
+- Releases are driven by `toys-release` (`.toys/release.rb`, config in `.toys/.data/releases.yml`). `CHANGELOG.md` is *generated* from conventional commit messages — do not hand-edit it. Use conventional prefixes (`fix:`, `feat:`, `chore:`, `!` or `BREAKING CHANGE:` for breaks) and reference issues with a `Fixes #N` trailer.
+- CI (`.github/workflows/ci.yml`) runs the matrix on ubuntu, macos, *and windows*, across Ruby 2.7-4.0 plus JRuby and TruffleRuby. Tests must be portable: Windows ignores POSIX directory permission bits and refuses to rename or delete directories with open handles inside, so permission- or handle-dependent tests need `skip` guards (see "raises if a repo cannot be removed").
