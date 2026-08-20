@@ -1,5 +1,9 @@
 # Release History
 
+### v0.1.2 / 2026-08-20
+
+* FIXED: Prevent git auto maintenance from racing with cache removals
+
 ### v0.1.1 / 2026-05-05
 
 * BREAKING CHANGE: Make GitCache.sources_writable? private for now
