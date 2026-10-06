@@ -65,6 +65,8 @@ A single flock on `locks/<md5>.lock` per remote serializes all writers for that 
 
 `repo_info`, `remove_refs`, `remove_sources`, and `remove_repos` first do a cheap unlocked `File.directory?` check so that asking about an uncached remote creates nothing (not even a lock file), then re-check under the lock.
 
+`remotes` deliberately takes each remote's lock to read its `state.json`, even though the atomic write means an unlocked read could never see a half-written file. The reason is Windows: CRuby opens files there without `FILE_SHARE_DELETE` by default, so an unlocked reader holding `state.json` open could make a concurrent `write_state` rename fail (and `get` raise), or block `remove_repos` from renaming the base dir. The cost is that `remotes` waits behind in-flight `get` calls, network fetches included. Don't "optimize" this into an unlocked read without verifying on Windows.
+
 Every git invocation goes through the `git` helper, which injects `-c maintenance.auto=false`. Do not bypass it. Since git 2.47, `git fetch` ends by spawning `git maintenance run --auto --detach`, which keeps writing into `repo/.git/objects` *after* the fetch has returned — outside anything the flock protects, and racing with the cache's own traversals and removals. `gc.auto=0` is not a substitute: it only suppresses that spawn as of git 2.55. See issue #5.
 
 ### Removal APIs
