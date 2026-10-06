@@ -29,6 +29,45 @@ describe ::GitCache do
     assert_equal(expected_remote_dir, ::GitCache.remote_dir_name(sample_remote))
   end
 
+  describe "when the cache directory cannot be created" do
+    let(:blocker_file) { ::File.join(::Dir.tmpdir, "git_cache_test_blocker") }
+    let(:uncreatable_dir) { ::File.join(blocker_file, "cache") }
+
+    before do
+      ::FileUtils.rm_rf(blocker_file)
+      ::File.write(blocker_file, "")
+    end
+
+    after do
+      ::FileUtils.rm_rf(blocker_file)
+    end
+
+    it "raises GitCache::Error without a hint when cache_dir is explicit" do
+      git_cache = ::GitCache.new(cache_dir: uncreatable_dir)
+      error = assert_raises(::GitCache::Error) do
+        git_cache.get(sample_remote)
+      end
+      assert_includes(error.message, "Unable to create git cache directory #{git_cache.cache_dir}")
+      refute_includes(error.message, "XDG_CACHE_HOME")
+      assert_nil(error.exec_result)
+    end
+
+    it "raises GitCache::Error with a hint when using the default cache dir" do
+      saved_xdg_cache_home = ::ENV["XDG_CACHE_HOME"]
+      begin
+        ::ENV["XDG_CACHE_HOME"] = uncreatable_dir
+        git_cache = ::GitCache.new
+      ensure
+        ::ENV["XDG_CACHE_HOME"] = saved_xdg_cache_home
+      end
+      error = assert_raises(::GitCache::Error) do
+        git_cache.get(sample_remote)
+      end
+      assert_includes(error.message, "Unable to create git cache directory #{git_cache.cache_dir}")
+      assert_includes(error.message, "Set XDG_CACHE_HOME to a writable directory")
+    end
+  end
+
   describe "normalize_path" do
     def normalize(path)
       ::GitCache.normalize_path(path)
