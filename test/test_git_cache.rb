@@ -23,7 +23,7 @@ describe ::GitCache do
 
   it "uses the default cache dir" do
     git_cache = ::GitCache.new
-    expected_cache_dir = ::File.join(::Dir.home, ".cache", "git-cache", "v1")
+    expected_cache_dir = ::File.join(::Dir.home, ".cache", "git-cache", "v2")
     assert_equal(expected_cache_dir, git_cache.cache_dir)
     expected_remote_dir = ::Digest::MD5.hexdigest(sample_remote)
     assert_equal(expected_remote_dir, ::GitCache.remote_dir_name(sample_remote))
@@ -144,14 +144,14 @@ describe ::GitCache do
     start1 = finish1 = start2 = finish2 = nil
     timestamp = ::Time.now.to_i
     thread1 = ::Thread.new do
-      git_cache.send(:lock_repo, cache_dir, "foo", timestamp) do
+      git_cache.send(:lock_repo, "abc", "foo", timestamp, create: true) do
         start1 = ::Process.clock_gettime(::Process::CLOCK_MONOTONIC)
         sleep(0.5)
         finish1 = ::Process.clock_gettime(::Process::CLOCK_MONOTONIC)
       end
     end
     thread2 = ::Thread.new do
-      git_cache.send(:lock_repo, cache_dir, "bar", timestamp) do
+      git_cache.send(:lock_repo, "abc", "bar", timestamp, create: true) do
         start2 = ::Process.clock_gettime(::Process::CLOCK_MONOTONIC)
         sleep(0.5)
         finish2 = ::Process.clock_gettime(::Process::CLOCK_MONOTONIC)
@@ -390,7 +390,7 @@ describe ::GitCache do
       create_branch(branch2)
 
       git_cache.get(local_remote, commit: branch1)
-      repo_path = ::File.join(git_cache.cache_dir,
+      repo_path = ::File.join(git_cache.cache_dir, "repos",
                               ::GitCache.remote_dir_name(local_remote), "repo")
       file_path = ::File.join(repo_path, "tmp.txt")
       ::File.open(file_path, "w") do |file|
@@ -472,8 +472,12 @@ describe ::GitCache do
 
       repo_info = git_cache.repo_info(local_remote)
 
+      name = ::GitCache.remote_dir_name(local_remote)
+      assert_equal(::File.join(cache_dir, "repos", name), repo_info.base_dir)
       assert(File.directory?(File.join(repo_info.base_dir, "repo")))
-      assert(File.file?(File.join(repo_info.base_dir, "repo.lock")))
+      assert(File.file?(File.join(repo_info.base_dir, "state.json")))
+      assert(File.file?(File.join(cache_dir, "locks", "#{name}.lock")))
+      refute(File.exist?(File.join(repo_info.base_dir, "repo.lock")))
       assert_equal(local_remote, repo_info.remote)
       assert(repo_info.last_accessed.between?(time1, time2))
 
@@ -579,8 +583,69 @@ describe ::GitCache do
       commit_file("file1.txt")
       git_cache.get(local_remote)
       git_cache.remove_repos(local_remote)
-      leftovers = ::Dir.children(cache_dir)
-      assert_empty(leftovers, "Expected an empty cache dir, got: #{leftovers}")
+      leftovers = ::Dir.children(::File.join(cache_dir, "repos"))
+      assert_empty(leftovers, "Expected an empty repos dir, got: #{leftovers}")
+    end
+
+    it "does not remove the lock file when removing a repo" do
+      commit_file("file1.txt")
+      git_cache.get(local_remote)
+      name = ::GitCache.remote_dir_name(local_remote)
+      lock_path = ::File.join(cache_dir, "locks", "#{name}.lock")
+      assert(::File.file?(lock_path))
+      ino = ::File.stat(lock_path).ino
+      git_cache.remove_repos(local_remote)
+      assert(::File.file?(lock_path))
+      skip("Inode numbers are not reliable on Windows") if ::Gem.win_platform?
+      assert_equal(ino, ::File.stat(lock_path).ino)
+    end
+
+    it "waits for an in-flight get before removing a repo" do
+      commit_file("file1.txt")
+      paused = ::Queue.new
+      resume = ::Queue.new
+      pauser = ::Module.new do
+        define_method(:ensure_commit) do |*args, **kwargs|
+          paused.push(true)
+          resume.pop
+          super(*args, **kwargs)
+        end
+      end
+      git_cache.singleton_class.prepend(pauser)
+      get_thread = ::Thread.new { git_cache.get(local_remote) }
+      begin
+        paused.pop
+        remove_thread = ::Thread.new { git_cache.remove_repos([local_remote]) }
+        sleep(0.5)
+        assert(remove_thread.alive?, "Expected remove_repos to wait for get")
+      ensure
+        resume.push(true)
+      end
+      assert(get_thread.join(10), "Timed out waiting for get")
+      path = get_thread.value
+      assert_kind_of(::String, path)
+      assert(remove_thread.join(10), "Timed out waiting for remove_repos")
+      assert_equal([local_remote], remove_thread.value)
+      assert_nil(git_cache.repo_info(local_remote))
+    end
+
+    it "creates nothing when querying an uncached remote" do
+      name = ::GitCache.remote_dir_name(local_remote)
+      assert_nil(git_cache.repo_info(local_remote))
+      assert_nil(git_cache.remove_refs(local_remote))
+      assert_nil(git_cache.remove_sources(local_remote))
+      assert_empty(git_cache.remove_repos([local_remote]))
+      refute(::File.exist?(::File.join(cache_dir, "locks", "#{name}.lock")))
+      refute(::File.exist?(::File.join(cache_dir, "repos", name)))
+    end
+
+    it "lists only cached remotes, ignoring lock files and trash" do
+      commit_file("file1.txt")
+      git_cache.get(local_remote)
+      trash_dir = ::File.join(cache_dir, "repos", ".trash-0123456789abcdef")
+      ::FileUtils.mkdir_p(trash_dir)
+      ::File.write(::File.join(trash_dir, "state.json"), '{"remote":"/trash/remote"}')
+      assert_equal([local_remote], git_cache.remotes)
     end
 
     it "raises if a repo cannot be removed" do
@@ -589,8 +654,9 @@ describe ::GitCache do
       commit_file("file1.txt")
       git_cache.get(local_remote)
       base_dir = git_cache.repo_info(local_remote).base_dir
-      # A read-only cache dir blocks both the rename and the fallback delete.
-      ::File.chmod(0o500, cache_dir)
+      # A read-only repos dir blocks both the rename and the fallback delete.
+      repos_dir = ::File.join(cache_dir, "repos")
+      ::File.chmod(0o500, repos_dir)
       begin
         error = assert_raises(::GitCache::Error) do
           git_cache.remove_repos(local_remote)
@@ -599,7 +665,7 @@ describe ::GitCache do
         assert_nil(error.exec_result)
         assert(::File.directory?(base_dir))
       ensure
-        ::File.chmod(0o700, cache_dir)
+        ::File.chmod(0o700, repos_dir)
       end
     end
 
