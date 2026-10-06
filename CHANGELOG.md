@@ -2,6 +2,8 @@
 
 ### v0.2.0 / 2026-10-06
 
+Note: This release changes the internal cache format from v1 to v2. This release will start with a new empty cache, but will not interfere with older versions and older caches.
+
 * FIXED: Raise GitCache::Error when the cache directory cannot be created
 * FIXED: Move repo locks out of the directories they protect
 * FIXED: Store cache data in a format version subdirectory of custom cache dirs
