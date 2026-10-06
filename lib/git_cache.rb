@@ -23,6 +23,7 @@ class GitCache
     require "json"
     require "securerandom"
     require "exec_service"
+    @using_default_cache_dir = cache_dir.nil?
     @cache_dir = ::File.expand_path(cache_dir || default_cache_dir)
     @exec = ::ExecService.new(out: :capture, err: :capture)
   end
@@ -307,7 +308,13 @@ class GitCache
 
   def ensure_repo_base_dir(remote)
     dir = repo_base_dir_for(remote)
-    ::FileUtils.mkdir_p(dir)
+    begin
+      ::FileUtils.mkdir_p(dir)
+    rescue ::SystemCallError => e
+      message = "Unable to create git cache directory #{dir}: #{e.message}"
+      message += ". Set XDG_CACHE_HOME to a writable directory." if @using_default_cache_dir
+      raise Error, message
+    end
     dir
   end
 
