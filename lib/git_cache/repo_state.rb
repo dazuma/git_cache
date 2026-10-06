@@ -2,9 +2,10 @@
 
 class GitCache
   ##
-  # Associated with each repo (remote) is a lock file that saves the status
-  # of the cache, and also serves as a file system lock for updates to the
-  # repo. This is handled by the lock_repo method.
+  # Associated with each repo (remote) is a state file, `state.json` in the
+  # repo's base dir, that saves the status of the cache. It is read and
+  # written only while holding the repo's lock, which is a separate file
+  # outside the base dir. This is handled by the lock_repo method.
   #
   # This object represents the state of the repo, and is made available to
   # the block passed to lock_repo. It has the following schema:
@@ -23,16 +24,18 @@ class GitCache
   #
   # @private
   #
-  class RepoLock
+  class RepoState
     ##
     # @private
     #
-    def initialize(io, remote, timestamp)
-      @data = ::JSON.parse(io.read) rescue {} # rubocop:disable Style/RescueModifier
+    def initialize(json, remote, timestamp)
+      @data = ::JSON.parse(json) rescue {} # rubocop:disable Style/RescueModifier
+      # Record the remote if the state lacks it (e.g. a new repo), so the
+      # repo is listed by GitCache#remotes even if nothing else is recorded.
+      @modified = @data["remote"].nil? && !remote.nil?
       @data["remote"] ||= remote
       @data["refs"] ||= {}
       @data["sources"] ||= {}
-      @modified = false
       @timestamp = timestamp || ::Time.now.to_i
     end
 
@@ -51,8 +54,8 @@ class GitCache
     ##
     # @private
     #
-    def dump(io)
-      ::JSON.dump(@data, io)
+    def dump
+      ::JSON.dump(@data)
     end
 
     ##

@@ -2,7 +2,7 @@
 
 require "git_cache/error"
 require "git_cache/repo_info"
-require "git_cache/repo_lock"
+require "git_cache/repo_state"
 
 ##
 # This object provides cached access to remote git data. Given a remote
@@ -15,7 +15,9 @@ class GitCache
   # Access a git cache.
   #
   # @param cache_dir [String] The path to the cache directory. Defaults to
-  #     a specific directory in the user's XDG cache.
+  #     a specific directory in the user's XDG cache. Cache data is stored
+  #     in a subdirectory named for the cache format version, so that clients
+  #     using incompatible formats can share a cache directory safely.
   #
   def initialize(cache_dir: nil)
     require "digest"
@@ -25,6 +27,7 @@ class GitCache
     require "exec_service"
     @using_default_cache_dir = cache_dir.nil?
     @cache_dir = ::File.expand_path(cache_dir || default_cache_dir)
+    @data_dir = ::File.join(@cache_dir, FORMAT_VERSION)
     @exec = ::ExecService.new(out: :capture, err: :capture)
   end
 
@@ -75,14 +78,15 @@ class GitCache
     path = ::GitCache.normalize_path(path)
     commit ||= "HEAD"
     timestamp ||= ::Time.now.to_i
-    dir = ensure_repo_base_dir(remote)
-    lock_repo(dir, remote, timestamp) do |repo_lock|
+    name = ::GitCache.remote_dir_name(remote)
+    dir = repo_base_dir_for(name)
+    lock_repo(name, remote, timestamp, create: true) do |repo_state|
       ensure_repo(dir, remote)
-      sha = ensure_commit(dir, commit, repo_lock, update)
+      sha = ensure_commit(dir, commit, repo_state, update)
       if into
-        copy_files(dir, sha, path, repo_lock, into)
+        copy_files(dir, sha, path, repo_state, into)
       else
-        ensure_source(dir, sha, path, repo_lock)
+        ensure_source(dir, sha, path, repo_state)
       end
     end
   end
@@ -95,14 +99,13 @@ class GitCache
   #
   def remotes
     result = []
-    return result unless ::File.directory?(cache_dir)
-    ::Dir.entries(cache_dir).each do |child|
-      next if child.start_with?(".")
-      dir = ::File.join(cache_dir, child)
-      if ::File.file?(::File.join(dir, LOCK_FILE_NAME))
-        remote = lock_repo(dir, &:remote)
-        result << remote if remote
-      end
+    repos_dir = ::File.join(@data_dir, REPOS_DIR_NAME)
+    return result unless ::File.directory?(repos_dir)
+    ::Dir.children(repos_dir).each do |name|
+      next if name.start_with?(".")
+      next unless ::File.file?(::File.join(repos_dir, name, STATE_FILE_NAME))
+      remote = lock_repo(name, &:remote)
+      result << remote if remote
     end
     result.sort
   end
@@ -115,10 +118,11 @@ class GitCache
   # @return [RepoInfo,nil]
   #
   def repo_info(remote)
-    dir = repo_base_dir_for(remote)
+    name = ::GitCache.remote_dir_name(remote)
+    dir = repo_base_dir_for(name)
     return nil unless ::File.directory?(dir)
-    lock_repo(dir, remote) do |repo_lock|
-      RepoInfo.new(dir, repo_lock.data)
+    lock_repo(name, remote) do |repo_state|
+      RepoInfo.new(dir, repo_state.data)
     end
   end
 
@@ -130,8 +134,9 @@ class GitCache
   # repositories are requested, they will be reloaded from the remote
   # repository from scratch.
   #
-  # Be careful not to remove repos that are currently in use by other
-  # GitCache clients.
+  # This waits for any in-progress {#get} calls for these repos to finish.
+  # However, be careful not to remove repos whose shared sources are
+  # currently in use by other GitCache clients.
   #
   # @param remotes [Array<String>,:all,nil] The remotes to remove. If set
   #     to :all or nil, removes all repos.
@@ -140,8 +145,14 @@ class GitCache
   def remove_repos(remotes)
     remotes = self.remotes if remotes.nil? || remotes == :all
     Array(remotes).map do |remote|
-      dir = repo_base_dir_for(remote)
-      if ::File.directory?(dir)
+      name = ::GitCache.remote_dir_name(remote)
+      dir = repo_base_dir_for(name)
+      next unless ::File.directory?(dir)
+      # Take the lock so we wait for any in-flight operation on this repo.
+      # The lock file lives outside the directory being removed, so it keeps
+      # excluding later clients after the removal.
+      flock_repo(name) do
+        next unless ::File.directory?(dir)
         remove_dir(dir)
         remote
       end
@@ -162,17 +173,17 @@ class GitCache
   #     the given repo is not in the cache.
   #
   def remove_refs(remote, refs: nil)
-    dir = repo_base_dir_for(remote)
-    return nil unless ::File.directory?(dir)
-    results = []
-    lock_repo(dir, remote) do |repo_lock|
-      refs = repo_lock.refs if refs.nil? || refs == :all
+    name = ::GitCache.remote_dir_name(remote)
+    return nil unless ::File.directory?(repo_base_dir_for(name))
+    lock_repo(name, remote) do |repo_state|
+      results = []
+      refs = repo_state.refs if refs.nil? || refs == :all
       Array(refs).each do |ref|
-        ref_data = repo_lock.delete_ref!(ref)
+        ref_data = repo_state.delete_ref!(ref)
         results << RefInfo.new(ref, ref_data) if ref_data
       end
+      results.sort
     end
-    results.sort
   end
 
   ##
@@ -192,30 +203,49 @@ class GitCache
   #     if the given repo is not in the cache.
   #
   def remove_sources(remote, commits: nil)
-    dir = repo_base_dir_for(remote)
+    name = ::GitCache.remote_dir_name(remote)
+    dir = repo_base_dir_for(name)
     return nil unless ::File.directory?(dir)
-    results = []
-    lock_repo(dir, remote) do |repo_lock|
+    lock_repo(name, remote) do |repo_state|
+      results = []
       commits = nil if commits == :all
-      shas = Array(commits).map { |ref| repo_lock.lookup_ref(ref) }.compact.uniq if commits
-      repo_lock.find_sources(shas: shas).each do |(sha, path)|
-        data = repo_lock.delete_source!(sha, path)
+      shas = Array(commits).map { |ref| repo_state.lookup_ref(ref) }.compact.uniq if commits
+      repo_state.find_sources(shas: shas).each do |(sha, path)|
+        data = repo_state.delete_source!(sha, path)
         results << SourceInfo.new(dir, sha, path, data)
       end
       results.map(&:sha).uniq.each do |sha|
-        unless repo_lock.source_exists?(sha)
+        unless repo_state.source_exists?(sha)
           remove_dir(::File.join(dir, sha))
         end
       end
+      results.sort
     end
-    results.sort
   end
 
   private
 
-  FORMAT_VERSION = "v1"
+  # Cache layout, relative to the cache directory:
+  #
+  #     <FORMAT_VERSION>/       Data dir. Bumping FORMAT_VERSION on
+  #                             incompatible layout changes isolates clients
+  #                             using different formats.
+  #       locks/<name>.lock     Lock file for the repo. Empty; used only as a
+  #                             flock target. Never deleted (see flock_repo).
+  #       repos/<name>/         Base dir for the repo. Removing it (via a
+  #                             rename) removes the repo from the cache.
+  #         state.json          Repo state (see RepoState).
+  #         repo/               Working clone of the remote.
+  #         <sha>/              Shared sources for a commit.
+  #
+  # where <name> is the remote_dir_name of the remote.
+  #
+  FORMAT_VERSION = "v2"
+  LOCKS_DIR_NAME = "locks"
+  REPOS_DIR_NAME = "repos"
+  LOCK_FILE_SUFFIX = ".lock"
+  STATE_FILE_NAME = "state.json"
   REPO_DIR_NAME = "repo"
-  LOCK_FILE_NAME = "repo.lock"
   TRASH_DIR_PREFIX = ".trash-"
 
   # Config applied to every git invocation. Auto maintenance would otherwise
@@ -227,16 +257,23 @@ class GitCache
   # keys they do not recognize.
   GIT_CONFIG_ARGS = ["-c", "maintenance.auto=false"].freeze
 
-  private_constant :REPO_DIR_NAME, :LOCK_FILE_NAME, :FORMAT_VERSION,
+  private_constant :FORMAT_VERSION, :LOCKS_DIR_NAME, :REPOS_DIR_NAME,
+                   :LOCK_FILE_SUFFIX, :STATE_FILE_NAME, :REPO_DIR_NAME,
                    :TRASH_DIR_PREFIX, :GIT_CONFIG_ARGS
 
-  def repo_base_dir_for(remote)
-    ::File.join(@cache_dir, ::GitCache.remote_dir_name(remote))
+  # Takes the remote_dir_name of a remote
+  def repo_base_dir_for(name)
+    ::File.join(@data_dir, REPOS_DIR_NAME, name)
+  end
+
+  # Takes the remote_dir_name of a remote
+  def repo_lock_path_for(name)
+    ::File.join(@data_dir, LOCKS_DIR_NAME, "#{name}#{LOCK_FILE_SUFFIX}")
   end
 
   def default_cache_dir
     require "simple_xdg"
-    ::File.join(::SimpleXDG.new.cache_home, "git-cache", FORMAT_VERSION)
+    ::File.join(::SimpleXDG.new.cache_home, "git-cache")
   end
 
   def git(dir, cmd, error_message: nil)
@@ -306,34 +343,80 @@ class GitCache
     nil
   end
 
-  def ensure_repo_base_dir(remote)
-    dir = repo_base_dir_for(remote)
-    begin
-      ::FileUtils.mkdir_p(dir)
-    rescue ::SystemCallError => e
-      message = "Unable to create git cache directory #{dir}: #{e.message}"
-      message += ". Set XDG_CACHE_HOME to a writable directory." if @using_default_cache_dir
-      raise Error, message
-    end
-    dir
+  def ensure_cache_subdir(dir)
+    ::FileUtils.mkdir_p(dir)
+  rescue ::SystemCallError => e
+    message = "Unable to create git cache directory #{dir}: #{e.message}"
+    message += ". Set XDG_CACHE_HOME to a writable directory." if @using_default_cache_dir
+    raise Error, message
   end
 
-  def lock_repo(dir, remote = nil, timestamp = nil)
-    lock_path = ::File.join(dir, LOCK_FILE_NAME)
+  # Takes an exclusive lock on the given repo for the duration of the block,
+  # and returns the value of the block. Takes the remote_dir_name of a remote.
+  #
+  # The lock file lives outside the repo's base dir, so that removing the
+  # base dir does not also remove the lock. Lock files must never be deleted:
+  # a flock belongs to an inode, so if the file were deleted, a newcomer
+  # would create a new one and "acquire" it while an older client still
+  # holds the lock on the old one.
+  #
+  def flock_repo(name)
+    lock_path = repo_lock_path_for(name)
+    ensure_cache_subdir(::File.dirname(lock_path))
     ::File.open(lock_path, ::File::RDWR | ::File::CREAT) do |file|
       file.flock(::File::LOCK_EX)
-      file.rewind
-      repo_lock = RepoLock.new(file, remote, timestamp)
+      yield
+    end
+  end
+
+  # Takes an exclusive lock on the given repo, and yields its state as a
+  # {RepoState}, writing the state back afterward if it was modified. Returns
+  # the value of the block. Takes the remote_dir_name of a remote.
+  #
+  # If create is true, creates the repo's base dir if it does not exist.
+  # Otherwise, if the base dir does not exist (e.g. because it was removed
+  # while we were waiting for the lock), returns nil without yielding.
+  #
+  def lock_repo(name, remote = nil, timestamp = nil, create: false)
+    flock_repo(name) do
+      dir = repo_base_dir_for(name)
+      if create
+        ensure_cache_subdir(dir)
+      elsif !::File.directory?(dir)
+        next nil
+      end
+      state_path = ::File.join(dir, STATE_FILE_NAME)
+      content = ::File.file?(state_path) ? ::File.read(state_path) : ""
+      repo_state = RepoState.new(content, remote, timestamp)
+      completed = false
       begin
-        yield repo_lock
+        result = yield repo_state
+        completed = true
+        result
       ensure
-        if repo_lock.modified?
-          file.rewind
-          file.truncate(0)
-          repo_lock.dump(file)
+        if repo_state.modified?
+          begin
+            write_state(state_path, repo_state)
+          rescue ::StandardError
+            # If the block failed, let its error propagate rather than this
+            # one. The atomic write leaves the previous state intact.
+            raise if completed
+          end
         end
       end
     end
+  end
+
+  # Writes the repo state to a temp file and renames it into place, so a
+  # failure partway through the write leaves the previous state intact. Must
+  # be called while holding the repo's lock.
+  #
+  def write_state(state_path, repo_state)
+    temp_path = "#{state_path}.tmp-#{::SecureRandom.hex(8)}"
+    ::File.write(temp_path, repo_state.dump)
+    ::File.rename(temp_path, state_path)
+  ensure
+    ::FileUtils.rm_f(temp_path)
   end
 
   def ensure_repo(dir, remote)
@@ -350,20 +433,20 @@ class GitCache
     end
   end
 
-  def ensure_commit(dir, commit, repo_lock, update = false)
+  def ensure_commit(dir, commit, repo_state, update = false)
     local_commit = "git-cache/#{commit}"
     repo_dir = ::File.join(dir, REPO_DIR_NAME)
     is_sha = ::GitCache.valid_sha?(commit)
-    update = repo_lock.ref_stale?(commit, update) unless is_sha
+    update = repo_state.ref_stale?(commit, update) unless is_sha
     if (update && !is_sha) || !commit_exists?(repo_dir, local_commit)
       git(repo_dir, ["fetch", "--depth=1", "--force", "origin", "#{commit}:#{local_commit}"],
           error_message: "Unable to fetch commit: #{commit}")
-      repo_lock.update_ref!(commit)
+      repo_state.update_ref!(commit)
     end
     result = git(repo_dir, ["rev-parse", local_commit],
                  error_message: "Unable to retrieve commit: #{local_commit}")
     sha = result.captured_out.strip
-    repo_lock.access_ref!(commit, sha)
+    repo_state.access_ref!(commit, sha)
     sha
   end
 
@@ -372,11 +455,11 @@ class GitCache
     result.success? && result.captured_out.strip == "commit"
   end
 
-  def ensure_source(dir, sha, path, repo_lock)
+  def ensure_source(dir, sha, path, repo_state)
     repo_path = ::File.join(dir, REPO_DIR_NAME)
     source_path = ::File.join(dir, sha)
     result =
-      if repo_lock.source_exists?(sha, path)
+      if repo_state.source_exists?(sha, path)
         ::GitCache.safe_join(source_path, path)
       else
         chmod_recursive("u+w", source_path)
@@ -386,14 +469,14 @@ class GitCache
           chmod_recursive("a-w", source_path) unless ::GitCache.sources_writable?
         end
       end
-    repo_lock.access_source!(sha, path)
+    repo_state.access_source!(sha, path)
     result
   end
 
-  def copy_files(dir, sha, path, repo_lock, into)
+  def copy_files(dir, sha, path, repo_state, into)
     repo_path = ::File.join(dir, REPO_DIR_NAME)
     result = copy_from_repo(repo_path, into, sha, path)
-    repo_lock.access_repo!
+    repo_state.access_repo!
     result
   end
 

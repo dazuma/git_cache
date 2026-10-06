@@ -33,19 +33,23 @@ The public surface is the `GitCache` class plus three value objects (`RepoInfo`,
 
 ### Cache layout on disk
 
-The cache directory (default: `<XDG_CACHE_HOME>/git-cache/v1`) contains one subdirectory per remote, named by `Digest::MD5.hexdigest(remote)`. Inside each remote's directory:
+The cache directory (`GitCache#cache_dir`; default: `<XDG_CACHE_HOME>/git-cache`) holds all data in a `v2/` subdirectory, the data dir (`@data_dir`). `v2` is `FORMAT_VERSION`, bumped on incompatible layout changes. It applies to custom `cache_dir:` roots too, so clients using different formats can safely share a root. The data dir contains two subdirectories. Each remote is identified by `<md5>` = `GitCache.remote_dir_name(remote)` = `Digest::MD5.hexdigest(remote)`.
 
-- `repo.lock` — JSON state file *and* OS-level exclusive flock for all mutations of this remote. Schema is documented inline above the `RepoLock` class. Holds `remote`, per-ref `{sha, updated, accessed}`, and per-source `{sha → path → {accessed}}` entries.
+- `locks/<md5>.lock` — an empty file that is only the target of the OS-level exclusive flock for all mutations of this remote. It lives *outside* the tree it protects and is **never deleted** (see "Concurrency model").
+- `repos/<md5>/` — the remote's base dir (`RepoInfo#base_dir`). Removing it removes the remote from the cache.
+
+Inside each base dir:
+
+- `state.json` — the JSON state, read and written only under the flock. `write_state` writes it atomically (temp file + rename), so a failed write leaves the previous state intact instead of an empty file, which would silently drop the remote from `remotes`. `RepoState` counts as modified whenever it fills in a missing `remote`, so every locked operation that knows the remote records it, even a `get` that fails before recording anything else. Schema is documented inline above the `RepoState` class. Holds `remote`, per-ref `{sha, updated, accessed}`, and per-source `{sha → path → {accessed}}` entries. It deliberately lives *inside* the base dir so that one atomic rename removes data and state together.
 - `repo/` — a single bare-ish working clone of the remote. Commits are fetched shallowly (`--depth=1`) into local refs named `git-cache/<original-ref>`, so every requested commit/branch/tag becomes its own local ref.
 - `<sha>/` — one directory per cached commit SHA, holding shared, *read-only* materialized source trees. Files inside are `chmod a-w` unless `GIT_CACHE_WRITABLE` is set (the env var exists for environments like temp-dir cleanup that can't handle read-only files).
 
 ### Key flows in `GitCache#get`
 
-1. `ensure_repo_base_dir` creates `<cache_dir>/<md5(remote)>/`.
-2. `lock_repo` opens `repo.lock`, takes an exclusive flock, parses the JSON state into a `RepoLock`, yields it, and writes back if `modified?` is true. **All mutating operations must run inside this block.**
-3. `ensure_repo` validates `repo/` actually points at the requested remote — if not, it nukes and re-inits the clone with the new origin. This is what makes hash collisions across remotes recoverable (and what makes destroying `repo/` on remote mismatch acceptable).
-4. `ensure_commit` fetches the requested ref into `git-cache/<ref>` if absent or stale (the `update:` parameter accepts `true`/`false`/seconds — staleness is computed from `RepoLock#ref_stale?`). SHAs (validated by length 40 or 64 hex) are never refetched.
-5. Output mode:
+1. `lock_repo(name, ..., create: true)` takes the flock (via the lock-only primitive `flock_repo`), *then* creates `repos/<md5>/` inside the lock — so a concurrent `remove_repos` can't rename it between creation and locking. It parses `state.json` into a `RepoState`, yields it, and writes back if `modified?` is true. **All mutating operations must run inside this block.** Without `create:`, `lock_repo` returns `nil` without yielding if the base dir is gone (e.g. removed while waiting for the lock).
+2. `ensure_repo` validates `repo/` actually points at the requested remote — if not, it nukes and re-inits the clone with the new origin. This is what makes hash collisions across remotes recoverable (and what makes destroying `repo/` on remote mismatch acceptable).
+3. `ensure_commit` fetches the requested ref into `git-cache/<ref>` if absent or stale (the `update:` parameter accepts `true`/`false`/seconds — staleness is computed from `RepoState#ref_stale?`). SHAs (validated by length 40 or 64 hex) are never refetched.
+4. Output mode:
    - `into:` provided → `copy_files` does a `git switch --detach <sha>` in `repo/` and recursively copies into the user's directory, skipping `.git` only when the requested path is the repo root.
    - `into:` omitted → `ensure_source` populates `<sha>/<path>` once and returns it as a *shared* read-only path. Subsequent calls for the same `(sha, path)` reuse it. The shared-source contract is "do not mutate," and that's enforced via filesystem permissions.
 
@@ -55,13 +59,19 @@ The cache directory (default: `<XDG_CACHE_HOME>/git-cache/v1`) contains one subd
 
 ### Concurrency model
 
-A single `repo.lock` flock per remote serializes all writers for that remote across processes. Readers of shared sources don't take the lock and rely on the read-only permission bits to detect tampering only by convention. The lock is held for the duration of any `GitCache#get` call, including the `git fetch`, so concurrent calls to the same remote will serialize on the network operation.
+A single flock on `locks/<md5>.lock` per remote serializes all writers for that remote across processes, including `remove_repos`, which waits for any in-flight `get`. Readers of shared sources don't take the lock and rely on the read-only permission bits to detect tampering only by convention. The lock is held for the duration of any `GitCache#get` call, including the `git fetch`, so concurrent calls to the same remote will serialize on the network operation.
+
+**Never delete lock files**, and never move the lock back inside `repos/<md5>/`. A flock belongs to the inode, and clients find the lock by opening the path with `File::CREAT`. If the file is deleted (directly, or by removing/renaming the directory containing it), the next client mints a new inode and "acquires" it while an older client still holds the lock on the old one, so the lock silently stops excluding anyone (issue #6). Safe deletion (re-checking the inode after locking) isn't portable to Windows. The cost — one empty file per remote ever cached — is accepted. Keeping the lock handle outside the base dir also lets `remove_repos` rename the base dir while holding the lock on Windows, which refuses to rename directories with open handles inside.
+
+`repo_info`, `remove_refs`, `remove_sources`, and `remove_repos` first do a cheap unlocked `File.directory?` check so that asking about an uncached remote creates nothing (not even a lock file), then re-check under the lock.
+
+`remotes` deliberately takes each remote's lock to read its `state.json`, even though the atomic write means an unlocked read could never see a half-written file. The reason is Windows: CRuby opens files there without `FILE_SHARE_DELETE` by default, so an unlocked reader holding `state.json` open could make a concurrent `write_state` rename fail (and `get` raise), or block `remove_repos` from renaming the base dir. The cost is that `remotes` waits behind in-flight `get` calls, network fetches included. Don't "optimize" this into an unlocked read without verifying on Windows.
 
 Every git invocation goes through the `git` helper, which injects `-c maintenance.auto=false`. Do not bypass it. Since git 2.47, `git fetch` ends by spawning `git maintenance run --auto --detach`, which keeps writing into `repo/.git/objects` *after* the fetch has returned — outside anything the flock protects, and racing with the cache's own traversals and removals. `gc.auto=0` is not a substitute: it only suppresses that spawn as of git 2.55. See issue #5.
 
 ### Removal APIs
 
-All directory removal goes through the private `remove_dir`, which renames the directory to a `.trash-<random>` sibling before deleting it. The rename is atomic and unaffected by concurrent writes inside the tree, so the cache entry is gone for clients even if the delete can't finish; leftovers are invisible (nothing enumerates cache directories — `remotes` skips dot-prefixed children and requires a `repo.lock`, and `RepoInfo` reads only the lock JSON) and get swept by later removals. It falls back to an in-place retry loop where rename fails (Windows), and raises `GitCache::Error` if the directory survives both.
+All directory removal goes through the private `remove_dir`, which renames the directory to a `.trash-<random>` sibling before deleting it. The rename is atomic and unaffected by concurrent writes inside the tree, so the cache entry is gone for clients even if the delete can't finish; leftovers are invisible (nothing enumerates cache directories — `remotes` lists only `repos/`, skips dot-prefixed children, and requires a `state.json`, and `RepoInfo` reads only the state JSON) and get swept by later removals. It falls back to an in-place retry loop where rename fails (Windows), and raises `GitCache::Error` if the directory survives both. `remove_repos` holds the remote's flock across `remove_dir(base_dir)`, so its trash lands in `repos/.trash-*`; `ensure_repo` and `remove_sources` leave theirs inside the base dir.
 
 `chmod_R u+w` before deleting defeats the read-only protection on shared sources, but must go through `chmod_recursive`: `FileUtils.chmod_R`'s `force:` guards only the chmod of each entry, not the traversal that finds them, so an entry vanishing mid-walk raises regardless of it. `remove_sources` also garbage-collects the per-SHA directory once its last source entry is dropped.
 
@@ -69,7 +79,7 @@ All directory removal goes through the private `remove_dir`, which renames the d
 
 - `lib/git_cache.rb` holds the `GitCache` class itself; value objects and internals live in `lib/git_cache/`. Resist splitting the main class further without a clear reason; the gemspec globs `lib/**/*.rb`, so additions ship automatically.
 - The gemspec deliberately excludes `CLAUDE.md` and `AGENTS.md` from the packaged gem.
-- Yardoc runs with `fail_on_warning` and `fail_on_undocumented_objects` — every public method/class/attribute needs a yard comment, and `@private` is the marker for internals (used heavily on `RepoLock`).
+- Yardoc runs with `fail_on_warning` and `fail_on_undocumented_objects` — every public method/class/attribute needs a yard comment, and `@private` is the marker for internals (used heavily on `RepoState`).
 - Rubocop config is in `.rubocop.yml`; respect it before committing.
 - The `.toys/` directory holds toys tool definitions and uses `toys-ci`. `.toys/.toys.rb` is the entrypoint; `.toys/ci.rb` defines the `ci` aggregate.
 - Releases are driven by `toys-release` (`.toys/release.rb`, config in `.toys/.data/releases.yml`). `CHANGELOG.md` is *generated* from conventional commit messages — do not hand-edit it. Use conventional prefixes (`fix:`, `feat:`, `chore:`, `!` or `BREAKING CHANGE:` for breaks) and reference issues with a `Fixes #N` trailer.
