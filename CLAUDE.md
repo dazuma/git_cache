@@ -74,3 +74,17 @@ All directory removal goes through the private `remove_dir`, which renames the d
 - The `.toys/` directory holds toys tool definitions and uses `toys-ci`. `.toys/.toys.rb` is the entrypoint; `.toys/ci.rb` defines the `ci` aggregate.
 - Releases are driven by `toys-release` (`.toys/release.rb`, config in `.toys/.data/releases.yml`). `CHANGELOG.md` is *generated* from conventional commit messages — do not hand-edit it. Use conventional prefixes (`fix:`, `feat:`, `chore:`, `!` or `BREAKING CHANGE:` for breaks) and reference issues with a `Fixes #N` trailer.
 - CI (`.github/workflows/ci.yml`) runs the matrix on ubuntu, macos, *and windows*, across Ruby 2.7-4.0 plus JRuby and TruffleRuby. Tests must be portable: Windows ignores POSIX directory permission bits and refuses to rename or delete directories with open handles inside, so permission- or handle-dependent tests need `skip` guards (see "raises if a repo cannot be removed").
+
+## Agent skills
+
+### Issue tracker
+
+Issues live in GitHub Issues for `dazuma/git_cache` (via the `gh` CLI). See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Default vocabulary: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: one `CONTEXT.md` plus `docs/adr/` at the repo root (both created lazily). See `docs/agents/domain.md`.
