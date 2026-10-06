@@ -388,10 +388,21 @@ class GitCache
       state_path = ::File.join(dir, STATE_FILE_NAME)
       content = ::File.file?(state_path) ? ::File.read(state_path) : ""
       repo_state = RepoState.new(content, remote, timestamp)
+      completed = false
       begin
-        yield repo_state
+        result = yield repo_state
+        completed = true
+        result
       ensure
-        write_state(state_path, repo_state) if repo_state.modified?
+        if repo_state.modified?
+          begin
+            write_state(state_path, repo_state)
+          rescue ::StandardError
+            # If the block failed, let its error propagate rather than this
+            # one. The atomic write leaves the previous state intact.
+            raise if completed
+          end
+        end
       end
     end
   end

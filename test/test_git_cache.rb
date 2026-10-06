@@ -528,6 +528,19 @@ describe ::GitCache do
       assert_nil(git_cache.repo_info(local_remote))
     end
 
+    it "raises the original error if writing the state also fails" do
+      commit_file("file1.txt")
+      FailingStateDump.enabled = true
+      begin
+        error = assert_raises(::GitCache::Error) do
+          git_cache.get(local_remote, commit: "nonexistent-branch")
+        end
+      ensure
+        FailingStateDump.enabled = false
+      end
+      assert_match(/nonexistent-branch/, error.message)
+    end
+
     it "keeps cache data in a format version subdirectory of a custom cache dir" do
       commit_file("file1.txt")
       git_cache.get(local_remote)
