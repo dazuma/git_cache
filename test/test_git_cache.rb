@@ -8,6 +8,24 @@ require "fileutils"
 require "net/http"
 require "uri"
 
+# When enabled, makes writing repo state fail partway through, simulating
+# e.g. a full disk or a crash during the write.
+module FailingStateDump
+  class << self
+    attr_accessor :enabled
+  end
+
+  def dump
+    return super unless FailingStateDump.enabled
+    content = ::Object.new
+    def content.to_s
+      raise ::IOError, "simulated failure while writing state"
+    end
+    content
+  end
+end
+::GitCache::RepoState.prepend(FailingStateDump)
+
 describe ::GitCache do
   let(:cache_dir) { ::File.join(::Dir.tmpdir, "git_cache_test") }
   let(:data_dir) { ::File.join(cache_dir, "v2") }
@@ -465,6 +483,39 @@ describe ::GitCache do
 
     it "returns nil when asked for repo info for a nonexistent remote" do
       assert_nil(git_cache.repo_info(local_remote))
+    end
+
+    it "preserves the previous repo state if writing the state fails" do
+      commit_file("file1.txt")
+      git_cache.get(local_remote, path: "file1.txt")
+      FailingStateDump.enabled = true
+      begin
+        assert_raises(::IOError) do
+          git_cache.get(local_remote, path: "file1.txt")
+        end
+      ensure
+        FailingStateDump.enabled = false
+      end
+      assert_equal([local_remote], git_cache.remotes)
+      repo_info = git_cache.repo_info(local_remote)
+      assert_equal(["HEAD"], repo_info.refs.map(&:ref))
+      assert_equal(["file1.txt"], repo_info.sources.map(&:git_path))
+    end
+
+    it "leaves no temp files behind if writing the state fails" do
+      commit_file("file1.txt")
+      git_cache.get(local_remote, path: "file1.txt")
+      base_dir = git_cache.repo_info(local_remote).base_dir
+      expected_children = ::Dir.children(base_dir).sort
+      FailingStateDump.enabled = true
+      begin
+        assert_raises(::IOError) do
+          git_cache.get(local_remote, path: "file1.txt")
+        end
+      ensure
+        FailingStateDump.enabled = false
+      end
+      assert_equal(expected_children, ::Dir.children(base_dir).sort)
     end
 
     it "keeps cache data in a format version subdirectory of a custom cache dir" do

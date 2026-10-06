@@ -40,7 +40,7 @@ The cache directory (`GitCache#cache_dir`; default: `<XDG_CACHE_HOME>/git-cache`
 
 Inside each base dir:
 
-- `state.json` — the JSON state, read and written only under the flock. Schema is documented inline above the `RepoState` class. Holds `remote`, per-ref `{sha, updated, accessed}`, and per-source `{sha → path → {accessed}}` entries. It deliberately lives *inside* the base dir so that one atomic rename removes data and state together.
+- `state.json` — the JSON state, read and written only under the flock. `write_state` writes it atomically (temp file + rename), so a failed write leaves the previous state intact instead of an empty file, which would silently drop the remote from `remotes`. Schema is documented inline above the `RepoState` class. Holds `remote`, per-ref `{sha, updated, accessed}`, and per-source `{sha → path → {accessed}}` entries. It deliberately lives *inside* the base dir so that one atomic rename removes data and state together.
 - `repo/` — a single bare-ish working clone of the remote. Commits are fetched shallowly (`--depth=1`) into local refs named `git-cache/<original-ref>`, so every requested commit/branch/tag becomes its own local ref.
 - `<sha>/` — one directory per cached commit SHA, holding shared, *read-only* materialized source trees. Files inside are `chmod a-w` unless `GIT_CACHE_WRITABLE` is set (the env var exists for environments like temp-dir cleanup that can't handle read-only files).
 

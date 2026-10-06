@@ -391,9 +391,21 @@ class GitCache
       begin
         yield repo_state
       ensure
-        ::File.write(state_path, repo_state.dump) if repo_state.modified?
+        write_state(state_path, repo_state) if repo_state.modified?
       end
     end
+  end
+
+  # Writes the repo state to a temp file and renames it into place, so a
+  # failure partway through the write leaves the previous state intact. Must
+  # be called while holding the repo's lock.
+  #
+  def write_state(state_path, repo_state)
+    temp_path = "#{state_path}.tmp-#{::SecureRandom.hex(8)}"
+    ::File.write(temp_path, repo_state.dump)
+    ::File.rename(temp_path, state_path)
+  ensure
+    ::FileUtils.rm_f(temp_path)
   end
 
   def ensure_repo(dir, remote)
