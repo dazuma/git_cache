@@ -30,10 +30,12 @@ class GitCache
     #
     def initialize(json, remote, timestamp)
       @data = ::JSON.parse(json) rescue {} # rubocop:disable Style/RescueModifier
+      # Record the remote if the state lacks it (e.g. a new repo), so the
+      # repo is listed by GitCache#remotes even if nothing else is recorded.
+      @modified = @data["remote"].nil? && !remote.nil?
       @data["remote"] ||= remote
       @data["refs"] ||= {}
       @data["sources"] ||= {}
-      @modified = false
       @timestamp = timestamp || ::Time.now.to_i
     end
 

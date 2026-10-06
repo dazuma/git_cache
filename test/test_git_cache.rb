@@ -518,6 +518,16 @@ describe ::GitCache do
       assert_equal(expected_children, ::Dir.children(base_dir).sort)
     end
 
+    it "can list and remove a repo whose first get failed" do
+      commit_file("file1.txt")
+      assert_raises(::GitCache::Error) do
+        git_cache.get(local_remote, commit: "nonexistent-branch")
+      end
+      assert_equal([local_remote], git_cache.remotes)
+      assert_equal([local_remote], git_cache.remove_repos(:all))
+      assert_nil(git_cache.repo_info(local_remote))
+    end
+
     it "keeps cache data in a format version subdirectory of a custom cache dir" do
       commit_file("file1.txt")
       git_cache.get(local_remote)
