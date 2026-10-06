@@ -10,6 +10,7 @@ require "uri"
 
 describe ::GitCache do
   let(:cache_dir) { ::File.join(::Dir.tmpdir, "git_cache_test") }
+  let(:data_dir) { ::File.join(cache_dir, "v2") }
   let(:git_cache) { ::GitCache.new(cache_dir: cache_dir) }
   let(:sample_remote) { "https://github.com/dazuma/git_cache.git" }
   let(:target_dir) { ::File.join(::Dir.tmpdir, "git_cache_test2") }
@@ -23,10 +24,14 @@ describe ::GitCache do
 
   it "uses the default cache dir" do
     git_cache = ::GitCache.new
-    expected_cache_dir = ::File.join(::Dir.home, ".cache", "git-cache", "v2")
+    expected_cache_dir = ::File.join(::Dir.home, ".cache", "git-cache")
     assert_equal(expected_cache_dir, git_cache.cache_dir)
     expected_remote_dir = ::Digest::MD5.hexdigest(sample_remote)
     assert_equal(expected_remote_dir, ::GitCache.remote_dir_name(sample_remote))
+  end
+
+  it "returns a custom cache dir as given" do
+    assert_equal(cache_dir, ::GitCache.new(cache_dir: cache_dir).cache_dir)
   end
 
   describe "when the cache directory cannot be created" do
@@ -390,7 +395,7 @@ describe ::GitCache do
       create_branch(branch2)
 
       git_cache.get(local_remote, commit: branch1)
-      repo_path = ::File.join(git_cache.cache_dir, "repos",
+      repo_path = ::File.join(data_dir, "repos",
                               ::GitCache.remote_dir_name(local_remote), "repo")
       file_path = ::File.join(repo_path, "tmp.txt")
       ::File.open(file_path, "w") do |file|
@@ -462,6 +467,15 @@ describe ::GitCache do
       assert_nil(git_cache.repo_info(local_remote))
     end
 
+    it "keeps cache data in a format version subdirectory of a custom cache dir" do
+      commit_file("file1.txt")
+      git_cache.get(local_remote)
+      assert_equal(["v2"], ::Dir.children(cache_dir))
+      base_dir = git_cache.repo_info(local_remote).base_dir
+      assert(base_dir.start_with?(::File.join(cache_dir, "v2", "")),
+             "Expected #{base_dir} to be under #{cache_dir}/v2")
+    end
+
     it "gets repo info for a local remote" do
       file_name = "file1.txt"
       commit_file(file_name)
@@ -473,10 +487,10 @@ describe ::GitCache do
       repo_info = git_cache.repo_info(local_remote)
 
       name = ::GitCache.remote_dir_name(local_remote)
-      assert_equal(::File.join(cache_dir, "repos", name), repo_info.base_dir)
+      assert_equal(::File.join(data_dir, "repos", name), repo_info.base_dir)
       assert(File.directory?(File.join(repo_info.base_dir, "repo")))
       assert(File.file?(File.join(repo_info.base_dir, "state.json")))
-      assert(File.file?(File.join(cache_dir, "locks", "#{name}.lock")))
+      assert(File.file?(File.join(data_dir, "locks", "#{name}.lock")))
       refute(File.exist?(File.join(repo_info.base_dir, "repo.lock")))
       assert_equal(local_remote, repo_info.remote)
       assert(repo_info.last_accessed.between?(time1, time2))
@@ -583,7 +597,7 @@ describe ::GitCache do
       commit_file("file1.txt")
       git_cache.get(local_remote)
       git_cache.remove_repos(local_remote)
-      leftovers = ::Dir.children(::File.join(cache_dir, "repos"))
+      leftovers = ::Dir.children(::File.join(data_dir, "repos"))
       assert_empty(leftovers, "Expected an empty repos dir, got: #{leftovers}")
     end
 
@@ -591,7 +605,7 @@ describe ::GitCache do
       commit_file("file1.txt")
       git_cache.get(local_remote)
       name = ::GitCache.remote_dir_name(local_remote)
-      lock_path = ::File.join(cache_dir, "locks", "#{name}.lock")
+      lock_path = ::File.join(data_dir, "locks", "#{name}.lock")
       assert(::File.file?(lock_path))
       ino = ::File.stat(lock_path).ino
       git_cache.remove_repos(local_remote)
@@ -635,14 +649,14 @@ describe ::GitCache do
       assert_nil(git_cache.remove_refs(local_remote))
       assert_nil(git_cache.remove_sources(local_remote))
       assert_empty(git_cache.remove_repos([local_remote]))
-      refute(::File.exist?(::File.join(cache_dir, "locks", "#{name}.lock")))
-      refute(::File.exist?(::File.join(cache_dir, "repos", name)))
+      refute(::File.exist?(::File.join(data_dir, "locks", "#{name}.lock")))
+      refute(::File.exist?(::File.join(data_dir, "repos", name)))
     end
 
     it "lists only cached remotes, ignoring lock files and trash" do
       commit_file("file1.txt")
       git_cache.get(local_remote)
-      trash_dir = ::File.join(cache_dir, "repos", ".trash-0123456789abcdef")
+      trash_dir = ::File.join(data_dir, "repos", ".trash-0123456789abcdef")
       ::FileUtils.mkdir_p(trash_dir)
       ::File.write(::File.join(trash_dir, "state.json"), '{"remote":"/trash/remote"}')
       assert_equal([local_remote], git_cache.remotes)
@@ -655,7 +669,7 @@ describe ::GitCache do
       git_cache.get(local_remote)
       base_dir = git_cache.repo_info(local_remote).base_dir
       # A read-only repos dir blocks both the rename and the fallback delete.
-      repos_dir = ::File.join(cache_dir, "repos")
+      repos_dir = ::File.join(data_dir, "repos")
       ::File.chmod(0o500, repos_dir)
       begin
         error = assert_raises(::GitCache::Error) do

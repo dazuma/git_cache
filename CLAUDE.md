@@ -33,7 +33,7 @@ The public surface is the `GitCache` class plus three value objects (`RepoInfo`,
 
 ### Cache layout on disk
 
-The cache directory (default: `<XDG_CACHE_HOME>/git-cache/v2`; the `v2` is `FORMAT_VERSION`, bumped on incompatible layout changes) contains two subdirectories. Each remote is identified by `<md5>` = `GitCache.remote_dir_name(remote)` = `Digest::MD5.hexdigest(remote)`.
+The cache directory (`GitCache#cache_dir`; default: `<XDG_CACHE_HOME>/git-cache`) holds all data in a `v2/` subdirectory, the data dir (`@data_dir`). `v2` is `FORMAT_VERSION`, bumped on incompatible layout changes. It applies to custom `cache_dir:` roots too, so clients using different formats can safely share a root. The data dir contains two subdirectories. Each remote is identified by `<md5>` = `GitCache.remote_dir_name(remote)` = `Digest::MD5.hexdigest(remote)`.
 
 - `locks/<md5>.lock` — an empty file that is only the target of the OS-level exclusive flock for all mutations of this remote. It lives *outside* the tree it protects and is **never deleted** (see "Concurrency model").
 - `repos/<md5>/` — the remote's base dir (`RepoInfo#base_dir`). Removing it removes the remote from the cache.

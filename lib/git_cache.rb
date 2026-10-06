@@ -15,7 +15,9 @@ class GitCache
   # Access a git cache.
   #
   # @param cache_dir [String] The path to the cache directory. Defaults to
-  #     a specific directory in the user's XDG cache.
+  #     a specific directory in the user's XDG cache. Cache data is stored
+  #     in a subdirectory named for the cache format version, so that clients
+  #     using incompatible formats can share a cache directory safely.
   #
   def initialize(cache_dir: nil)
     require "digest"
@@ -25,6 +27,7 @@ class GitCache
     require "exec_service"
     @using_default_cache_dir = cache_dir.nil?
     @cache_dir = ::File.expand_path(cache_dir || default_cache_dir)
+    @data_dir = ::File.join(@cache_dir, FORMAT_VERSION)
     @exec = ::ExecService.new(out: :capture, err: :capture)
   end
 
@@ -96,7 +99,7 @@ class GitCache
   #
   def remotes
     result = []
-    repos_dir = ::File.join(cache_dir, REPOS_DIR_NAME)
+    repos_dir = ::File.join(@data_dir, REPOS_DIR_NAME)
     return result unless ::File.directory?(repos_dir)
     ::Dir.children(repos_dir).each do |name|
       next if name.start_with?(".")
@@ -224,13 +227,16 @@ class GitCache
 
   # Cache layout, relative to the cache directory:
   #
-  #     locks/<name>.lock     Lock file for the repo. Empty; used only as a
-  #                           flock target. Never deleted (see flock_repo).
-  #     repos/<name>/         Base dir for the repo. Removing it (via a
-  #                           rename) removes the repo from the cache.
-  #       state.json          Repo state (see RepoState).
-  #       repo/               Working clone of the remote.
-  #       <sha>/              Shared sources for a commit.
+  #     <FORMAT_VERSION>/       Data dir. Bumping FORMAT_VERSION on
+  #                             incompatible layout changes isolates clients
+  #                             using different formats.
+  #       locks/<name>.lock     Lock file for the repo. Empty; used only as a
+  #                             flock target. Never deleted (see flock_repo).
+  #       repos/<name>/         Base dir for the repo. Removing it (via a
+  #                             rename) removes the repo from the cache.
+  #         state.json          Repo state (see RepoState).
+  #         repo/               Working clone of the remote.
+  #         <sha>/              Shared sources for a commit.
   #
   # where <name> is the remote_dir_name of the remote.
   #
@@ -257,17 +263,17 @@ class GitCache
 
   # Takes the remote_dir_name of a remote
   def repo_base_dir_for(name)
-    ::File.join(@cache_dir, REPOS_DIR_NAME, name)
+    ::File.join(@data_dir, REPOS_DIR_NAME, name)
   end
 
   # Takes the remote_dir_name of a remote
   def repo_lock_path_for(name)
-    ::File.join(@cache_dir, LOCKS_DIR_NAME, "#{name}#{LOCK_FILE_SUFFIX}")
+    ::File.join(@data_dir, LOCKS_DIR_NAME, "#{name}#{LOCK_FILE_SUFFIX}")
   end
 
   def default_cache_dir
     require "simple_xdg"
-    ::File.join(::SimpleXDG.new.cache_home, "git-cache", FORMAT_VERSION)
+    ::File.join(::SimpleXDG.new.cache_home, "git-cache")
   end
 
   def git(dir, cmd, error_message: nil)
