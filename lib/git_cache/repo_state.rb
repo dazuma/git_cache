@@ -24,7 +24,7 @@ class GitCache
   #
   # @private
   #
-  class RepoLock
+  class RepoState
     ##
     # @private
     #

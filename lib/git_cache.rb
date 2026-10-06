@@ -2,7 +2,7 @@
 
 require "git_cache/error"
 require "git_cache/repo_info"
-require "git_cache/repo_lock"
+require "git_cache/repo_state"
 
 ##
 # This object provides cached access to remote git data. Given a remote
@@ -77,13 +77,13 @@ class GitCache
     timestamp ||= ::Time.now.to_i
     name = ::GitCache.remote_dir_name(remote)
     dir = repo_base_dir_for(name)
-    lock_repo(name, remote, timestamp, create: true) do |repo_lock|
+    lock_repo(name, remote, timestamp, create: true) do |repo_state|
       ensure_repo(dir, remote)
-      sha = ensure_commit(dir, commit, repo_lock, update)
+      sha = ensure_commit(dir, commit, repo_state, update)
       if into
-        copy_files(dir, sha, path, repo_lock, into)
+        copy_files(dir, sha, path, repo_state, into)
       else
-        ensure_source(dir, sha, path, repo_lock)
+        ensure_source(dir, sha, path, repo_state)
       end
     end
   end
@@ -118,8 +118,8 @@ class GitCache
     name = ::GitCache.remote_dir_name(remote)
     dir = repo_base_dir_for(name)
     return nil unless ::File.directory?(dir)
-    lock_repo(name, remote) do |repo_lock|
-      RepoInfo.new(dir, repo_lock.data)
+    lock_repo(name, remote) do |repo_state|
+      RepoInfo.new(dir, repo_state.data)
     end
   end
 
@@ -172,11 +172,11 @@ class GitCache
   def remove_refs(remote, refs: nil)
     name = ::GitCache.remote_dir_name(remote)
     return nil unless ::File.directory?(repo_base_dir_for(name))
-    lock_repo(name, remote) do |repo_lock|
+    lock_repo(name, remote) do |repo_state|
       results = []
-      refs = repo_lock.refs if refs.nil? || refs == :all
+      refs = repo_state.refs if refs.nil? || refs == :all
       Array(refs).each do |ref|
-        ref_data = repo_lock.delete_ref!(ref)
+        ref_data = repo_state.delete_ref!(ref)
         results << RefInfo.new(ref, ref_data) if ref_data
       end
       results.sort
@@ -203,16 +203,16 @@ class GitCache
     name = ::GitCache.remote_dir_name(remote)
     dir = repo_base_dir_for(name)
     return nil unless ::File.directory?(dir)
-    lock_repo(name, remote) do |repo_lock|
+    lock_repo(name, remote) do |repo_state|
       results = []
       commits = nil if commits == :all
-      shas = Array(commits).map { |ref| repo_lock.lookup_ref(ref) }.compact.uniq if commits
-      repo_lock.find_sources(shas: shas).each do |(sha, path)|
-        data = repo_lock.delete_source!(sha, path)
+      shas = Array(commits).map { |ref| repo_state.lookup_ref(ref) }.compact.uniq if commits
+      repo_state.find_sources(shas: shas).each do |(sha, path)|
+        data = repo_state.delete_source!(sha, path)
         results << SourceInfo.new(dir, sha, path, data)
       end
       results.map(&:sha).uniq.each do |sha|
-        unless repo_lock.source_exists?(sha)
+        unless repo_state.source_exists?(sha)
           remove_dir(::File.join(dir, sha))
         end
       end
@@ -228,7 +228,7 @@ class GitCache
   #                           flock target. Never deleted (see flock_repo).
   #     repos/<name>/         Base dir for the repo. Removing it (via a
   #                           rename) removes the repo from the cache.
-  #       state.json          Repo state (see RepoLock).
+  #       state.json          Repo state (see RepoState).
   #       repo/               Working clone of the remote.
   #       <sha>/              Shared sources for a commit.
   #
@@ -364,7 +364,7 @@ class GitCache
   end
 
   # Takes an exclusive lock on the given repo, and yields its state as a
-  # {RepoLock}, writing the state back afterward if it was modified. Returns
+  # {RepoState}, writing the state back afterward if it was modified. Returns
   # the value of the block. Takes the remote_dir_name of a remote.
   #
   # If create is true, creates the repo's base dir if it does not exist.
@@ -381,11 +381,11 @@ class GitCache
       end
       state_path = ::File.join(dir, STATE_FILE_NAME)
       content = ::File.file?(state_path) ? ::File.read(state_path) : ""
-      repo_lock = RepoLock.new(content, remote, timestamp)
+      repo_state = RepoState.new(content, remote, timestamp)
       begin
-        yield repo_lock
+        yield repo_state
       ensure
-        ::File.write(state_path, repo_lock.dump) if repo_lock.modified?
+        ::File.write(state_path, repo_state.dump) if repo_state.modified?
       end
     end
   end
@@ -404,20 +404,20 @@ class GitCache
     end
   end
 
-  def ensure_commit(dir, commit, repo_lock, update = false)
+  def ensure_commit(dir, commit, repo_state, update = false)
     local_commit = "git-cache/#{commit}"
     repo_dir = ::File.join(dir, REPO_DIR_NAME)
     is_sha = ::GitCache.valid_sha?(commit)
-    update = repo_lock.ref_stale?(commit, update) unless is_sha
+    update = repo_state.ref_stale?(commit, update) unless is_sha
     if (update && !is_sha) || !commit_exists?(repo_dir, local_commit)
       git(repo_dir, ["fetch", "--depth=1", "--force", "origin", "#{commit}:#{local_commit}"],
           error_message: "Unable to fetch commit: #{commit}")
-      repo_lock.update_ref!(commit)
+      repo_state.update_ref!(commit)
     end
     result = git(repo_dir, ["rev-parse", local_commit],
                  error_message: "Unable to retrieve commit: #{local_commit}")
     sha = result.captured_out.strip
-    repo_lock.access_ref!(commit, sha)
+    repo_state.access_ref!(commit, sha)
     sha
   end
 
@@ -426,11 +426,11 @@ class GitCache
     result.success? && result.captured_out.strip == "commit"
   end
 
-  def ensure_source(dir, sha, path, repo_lock)
+  def ensure_source(dir, sha, path, repo_state)
     repo_path = ::File.join(dir, REPO_DIR_NAME)
     source_path = ::File.join(dir, sha)
     result =
-      if repo_lock.source_exists?(sha, path)
+      if repo_state.source_exists?(sha, path)
         ::GitCache.safe_join(source_path, path)
       else
         chmod_recursive("u+w", source_path)
@@ -440,14 +440,14 @@ class GitCache
           chmod_recursive("a-w", source_path) unless ::GitCache.sources_writable?
         end
       end
-    repo_lock.access_source!(sha, path)
+    repo_state.access_source!(sha, path)
     result
   end
 
-  def copy_files(dir, sha, path, repo_lock, into)
+  def copy_files(dir, sha, path, repo_state, into)
     repo_path = ::File.join(dir, REPO_DIR_NAME)
     result = copy_from_repo(repo_path, into, sha, path)
-    repo_lock.access_repo!
+    repo_state.access_repo!
     result
   end
 

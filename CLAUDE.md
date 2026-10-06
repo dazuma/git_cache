@@ -40,15 +40,15 @@ The cache directory (default: `<XDG_CACHE_HOME>/git-cache/v2`; the `v2` is `FORM
 
 Inside each base dir:
 
-- `state.json` — the JSON state, read and written only under the flock. Schema is documented inline above the `RepoLock` class. Holds `remote`, per-ref `{sha, updated, accessed}`, and per-source `{sha → path → {accessed}}` entries. It deliberately lives *inside* the base dir so that one atomic rename removes data and state together.
+- `state.json` — the JSON state, read and written only under the flock. Schema is documented inline above the `RepoState` class. Holds `remote`, per-ref `{sha, updated, accessed}`, and per-source `{sha → path → {accessed}}` entries. It deliberately lives *inside* the base dir so that one atomic rename removes data and state together.
 - `repo/` — a single bare-ish working clone of the remote. Commits are fetched shallowly (`--depth=1`) into local refs named `git-cache/<original-ref>`, so every requested commit/branch/tag becomes its own local ref.
 - `<sha>/` — one directory per cached commit SHA, holding shared, *read-only* materialized source trees. Files inside are `chmod a-w` unless `GIT_CACHE_WRITABLE` is set (the env var exists for environments like temp-dir cleanup that can't handle read-only files).
 
 ### Key flows in `GitCache#get`
 
-1. `lock_repo(name, ..., create: true)` takes the flock (via the lock-only primitive `flock_repo`), *then* creates `repos/<md5>/` inside the lock — so a concurrent `remove_repos` can't rename it between creation and locking. It parses `state.json` into a `RepoLock`, yields it, and writes back if `modified?` is true. **All mutating operations must run inside this block.** Without `create:`, `lock_repo` returns `nil` without yielding if the base dir is gone (e.g. removed while waiting for the lock).
+1. `lock_repo(name, ..., create: true)` takes the flock (via the lock-only primitive `flock_repo`), *then* creates `repos/<md5>/` inside the lock — so a concurrent `remove_repos` can't rename it between creation and locking. It parses `state.json` into a `RepoState`, yields it, and writes back if `modified?` is true. **All mutating operations must run inside this block.** Without `create:`, `lock_repo` returns `nil` without yielding if the base dir is gone (e.g. removed while waiting for the lock).
 2. `ensure_repo` validates `repo/` actually points at the requested remote — if not, it nukes and re-inits the clone with the new origin. This is what makes hash collisions across remotes recoverable (and what makes destroying `repo/` on remote mismatch acceptable).
-3. `ensure_commit` fetches the requested ref into `git-cache/<ref>` if absent or stale (the `update:` parameter accepts `true`/`false`/seconds — staleness is computed from `RepoLock#ref_stale?`). SHAs (validated by length 40 or 64 hex) are never refetched.
+3. `ensure_commit` fetches the requested ref into `git-cache/<ref>` if absent or stale (the `update:` parameter accepts `true`/`false`/seconds — staleness is computed from `RepoState#ref_stale?`). SHAs (validated by length 40 or 64 hex) are never refetched.
 4. Output mode:
    - `into:` provided → `copy_files` does a `git switch --detach <sha>` in `repo/` and recursively copies into the user's directory, skipping `.git` only when the requested path is the repo root.
    - `into:` omitted → `ensure_source` populates `<sha>/<path>` once and returns it as a *shared* read-only path. Subsequent calls for the same `(sha, path)` reuse it. The shared-source contract is "do not mutate," and that's enforced via filesystem permissions.
@@ -77,7 +77,7 @@ All directory removal goes through the private `remove_dir`, which renames the d
 
 - `lib/git_cache.rb` holds the `GitCache` class itself; value objects and internals live in `lib/git_cache/`. Resist splitting the main class further without a clear reason; the gemspec globs `lib/**/*.rb`, so additions ship automatically.
 - The gemspec deliberately excludes `CLAUDE.md` and `AGENTS.md` from the packaged gem.
-- Yardoc runs with `fail_on_warning` and `fail_on_undocumented_objects` — every public method/class/attribute needs a yard comment, and `@private` is the marker for internals (used heavily on `RepoLock`).
+- Yardoc runs with `fail_on_warning` and `fail_on_undocumented_objects` — every public method/class/attribute needs a yard comment, and `@private` is the marker for internals (used heavily on `RepoState`).
 - Rubocop config is in `.rubocop.yml`; respect it before committing.
 - The `.toys/` directory holds toys tool definitions and uses `toys-ci`. `.toys/.toys.rb` is the entrypoint; `.toys/ci.rb` defines the `ci` aggregate.
 - Releases are driven by `toys-release` (`.toys/release.rb`, config in `.toys/.data/releases.yml`). `CHANGELOG.md` is *generated* from conventional commit messages — do not hand-edit it. Use conventional prefixes (`fix:`, `feat:`, `chore:`, `!` or `BREAKING CHANGE:` for breaks) and reference issues with a `Fixes #N` trailer.
